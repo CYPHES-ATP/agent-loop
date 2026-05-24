@@ -11,7 +11,7 @@ import os
 import secrets
 import shutil
 import socket
-import tempfile
+import sys
 import threading
 import time
 import urllib.error
@@ -19,10 +19,11 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import uvicorn
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -130,9 +131,26 @@ class AgentIdentity:
             return False
 
 
-def sign_with_private_key(private_key: Ed25519PrivateKey, payload: bytes) -> str:
-    """Sign canonical bytes with an Ed25519 private key."""
-    return b64url_encode(private_key.sign(payload))
+def export_public_key(identity: AgentIdentity) -> Dict[str, str]:
+    """Export an ATP agent's public key as raw unpadded base64url bytes."""
+    public_bytes = identity.public_key.public_bytes(
+        encoding=Encoding.Raw,
+        format=PublicFormat.Raw,
+    )
+    return {
+        "kid": identity.kid,
+        "alg": "Ed25519",
+        "publicKeyBase64Url": b64url_encode(public_bytes),
+    }
+
+
+def import_public_key(record: Dict[str, str]) -> Ed25519PublicKey:
+    """Import a raw Ed25519 public key from a public-keys.json record."""
+    if record.get("alg") != "Ed25519":
+        raise ValueError(f"unsupported public key alg: {record.get('alg')}")
+    return Ed25519PublicKey.from_public_bytes(
+        b64url_decode(record["publicKeyBase64Url"])
+    )
 
 
 def verify_with_public_key(
@@ -232,8 +250,10 @@ def require_envelope_fields(envelope: Dict[str, Any]) -> None:
 def verify_envelope(
     envelope: Dict[str, Any],
     expected_prev: str,
+    expected_audience: str,
     public_keys: Dict[str, Ed25519PublicKey],
     nonces: NonceTracker,
+    check_expiry: bool = True,
 ) -> bool:
     """Verify an ATP envelope signature, nonce, expiry, prev, and verb."""
     require_envelope_fields(envelope)
@@ -243,15 +263,17 @@ def verify_envelope(
         raise ValueError(f"unexpected transaction id: {envelope['transactionId']}")
     if envelope["verb"] not in SUPPORTED_VERBS:
         raise ValueError(f"unsupported ATP verb: {envelope['verb']}")
+    if envelope["audience"] != expected_audience:
+        raise ValueError(
+            f"unexpected audience: expected {expected_audience}, got {envelope['audience']}"
+        )
     if envelope["prev"] != expected_prev:
         raise ValueError(f"ATP_BAD_PREV: expected {expected_prev}, got {envelope['prev']}")
-    if parse_iso_utc(envelope["expiresAt"]) <= utc_now():
+    if check_expiry and parse_iso_utc(envelope["expiresAt"]) <= utc_now():
         raise ValueError("ATP_STALE: envelope expired")
     issuer = envelope["issuer"]
     if issuer not in public_keys:
         raise ValueError(f"unknown issuer: {issuer}")
-    if not nonces.accept(issuer, envelope["nonce"]):
-        raise ValueError(f"ATP_STALE: nonce already accepted for {issuer}")
     proofs = envelope["proofs"]
     if not isinstance(proofs, list) or len(proofs) != 1:
         raise ValueError("envelope must contain exactly one proof")
@@ -267,6 +289,8 @@ def verify_envelope(
         proof["signature"],
     ):
         raise ValueError("ATP_BAD_SIG: envelope signature verification failed")
+    if not nonces.accept(issuer, envelope["nonce"]):
+        raise ValueError(f"ATP_STALE: nonce already accepted for {issuer}")
     return True
 
 
@@ -288,6 +312,64 @@ def get_json(url: str) -> Dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def capability_card_body(worker_did: str, port: int) -> Dict[str, Any]:
+    """Build the unsigned ATP worker capability card."""
+    return {
+        "atp": ATP_VERSION,
+        "agentId": worker_did,
+        "endpoints": [
+            {"transport": "http", "url": f"http://127.0.0.1:{port}/atp"}
+        ],
+        "capabilities": [
+            "photo-organization",
+            "metadata-extraction",
+            "duplicate-detection",
+        ],
+        "proofMethods": ["Ed25519"],
+        "settlementRails": ["zero-value"],
+        "requiredExtensions": [],
+    }
+
+
+def signed_capability_card(worker: AgentIdentity, port: int) -> Dict[str, Any]:
+    """Create a signed ATP capability card evidence object."""
+    card = capability_card_body(worker.did, port)
+    return {
+        "card": card,
+        "proof": {
+            "type": "Ed25519",
+            "kid": worker.kid,
+            "signature": worker.sign(canon(card)),
+        },
+        "cardHash": sha256_json(card),
+    }
+
+
+def verify_capability_card(
+    signed_card: Dict[str, Any],
+    worker_public_key: Ed25519PublicKey,
+) -> bool:
+    """Verify a signed worker capability card and its cardHash."""
+    card = signed_card["card"]
+    proof = signed_card["proof"]
+    expected_hash = sha256_json(card)
+    if signed_card.get("cardHash") != expected_hash:
+        raise ValueError("capability card hash mismatch")
+    if card.get("atp") != ATP_VERSION:
+        raise ValueError("capability card ATP version mismatch")
+    if card.get("agentId") != WORKER_DID:
+        raise ValueError("capability card worker DID mismatch")
+    if "photo-organization" not in card.get("capabilities", []):
+        raise ValueError("capability card missing photo-organization")
+    if proof.get("type") != "Ed25519":
+        raise ValueError("capability card proof type mismatch")
+    if proof.get("kid") != f"{WORKER_DID}#key-1":
+        raise ValueError("capability card kid mismatch")
+    if not verify_with_public_key(worker_public_key, canon(card), proof["signature"]):
+        raise ValueError("capability card signature invalid")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 3. ATP event log
 # ---------------------------------------------------------------------------
@@ -296,14 +378,16 @@ def get_json(url: str) -> Dict[str, Any]:
 class EventLog:
     """Append-only ATP event log with monotone hash chaining."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, envelopes_path: Path) -> None:
         """Create an empty transcript at the requested path."""
         self.path = path
+        self.envelopes_path = envelopes_path
         self.events: List[Dict[str, Any]] = []
         self.envelopes: List[Dict[str, Any]] = []
         self.current_root = GENESIS_HASH
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("", encoding="utf-8")
+        self.envelopes_path.write_text("", encoding="utf-8")
 
     def append(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
         """Append one accepted ATP envelope to the transcript."""
@@ -329,6 +413,8 @@ class EventLog:
         }
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
+        with self.envelopes_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(envelope, sort_keys=True) + "\n")
         self.events.append(event)
         self.envelopes.append(envelope)
         self.current_root = event_hash
@@ -558,7 +644,11 @@ def sign_lease(lease: Dict[str, Any], owner: AgentIdentity) -> Dict[str, Any]:
     return signed
 
 
-def verify_lease(lease: Dict[str, Any], owner_public_key: Ed25519PublicKey) -> bool:
+def verify_lease(
+    lease: Dict[str, Any],
+    owner_public_key: Ed25519PublicKey,
+    check_ttl: bool = True,
+) -> bool:
     """Verify a signed ATP context lease and its TTL."""
     signature = lease.get("sig")
     if not signature:
@@ -569,14 +659,19 @@ def verify_lease(lease: Dict[str, Any], owner_public_key: Ed25519PublicKey) -> b
         raise ValueError(f"lease {lease.get('id')} signature invalid")
     ttl = lease["ttl"]
     now = utc_now()
-    if not (parse_iso_utc(ttl["start"]) <= now <= parse_iso_utc(ttl["end"])):
+    if check_ttl and not (
+        parse_iso_utc(ttl["start"]) <= now <= parse_iso_utc(ttl["end"])
+    ):
         raise ValueError(f"lease {lease.get('id')} outside ttl")
+    parse_iso_utc(ttl["start"])
+    parse_iso_utc(ttl["end"])
     return True
 
 
 def verify_leases(
     leases: List[Dict[str, Any]],
     requester_public_key: Ed25519PublicKey,
+    check_ttl: bool = True,
 ) -> bool:
     """Verify all route leases before worker execution."""
     required_ids = {"lease_photos_read_001", "lease_stage_write_001"}
@@ -584,7 +679,7 @@ def verify_leases(
     if observed_ids != required_ids:
         raise ValueError(f"unexpected lease ids: {observed_ids}")
     for lease in leases:
-        verify_lease(lease, requester_public_key)
+        verify_lease(lease, requester_public_key, check_ttl=check_ttl)
     return True
 
 
@@ -606,6 +701,30 @@ def receipt_signature_body(receipt: Dict[str, Any]) -> Dict[str, Any]:
     body = dict(receipt)
     body.pop("signatures", None)
     return body
+
+
+def artifact_records(artifact_dir: Path) -> List[Dict[str, Any]]:
+    """Describe produced artifacts with path, hash, size, and media type."""
+    media_types = {
+        "manifest.json": "application/json",
+        "album-plan.json": "application/json",
+        "duplicate-candidates.csv": "text/csv",
+    }
+    records: List[Dict[str, Any]] = []
+    for name in ["manifest.json", "album-plan.json", "duplicate-candidates.csv"]:
+        path = artifact_dir / name
+        if not path.is_file():
+            raise ValueError(f"missing artifact file: {name}")
+        data = path.read_bytes()
+        records.append(
+            {
+                "path": name,
+                "sha256": sha256_bytes(data),
+                "sizeBytes": len(data),
+                "mediaType": media_types[name],
+            }
+        )
+    return records
 
 
 def create_receipt(
@@ -635,11 +754,7 @@ def create_receipt(
             "resources": [str(photo_dir.resolve()), str(staging_dir.resolve())],
         },
         "changed": {
-            "artifacts": [
-                "manifest.json",
-                "album-plan.json",
-                "duplicate-candidates.csv",
-            ],
+            "artifacts": artifact_records(staging_dir),
             "externalState": "staging-directory-only",
             "originalsModified": originals_modified,
         },
@@ -734,28 +849,15 @@ class WorkerContext:
         self.original_hashes_after: Dict[str, str] = {}
 
     def capability_card(self) -> Dict[str, Any]:
-        """Return the worker's ATP discovery document."""
-        return {
-            "atp": ATP_VERSION,
-            "agentId": self.worker.did,
-            "endpoints": [
-                {"transport": "http", "url": f"http://127.0.0.1:{self.port}/atp"}
-            ],
-            "capabilities": [
-                "photo-organization",
-                "metadata-extraction",
-                "duplicate-detection",
-            ],
-            "proofMethods": ["Ed25519"],
-            "settlementRails": ["zero-value"],
-            "requiredExtensions": [],
-        }
+        """Return the worker's signed ATP discovery document."""
+        return signed_capability_card(self.worker, self.port)
 
     def accept_inbound(self, envelope: Dict[str, Any]) -> None:
         """Validate, state-check, and append an inbound ATP envelope."""
         verify_envelope(
             envelope=envelope,
             expected_prev=self.event_log.current_root,
+            expected_audience=self.worker.did,
             public_keys=self.public_keys,
             nonces=self.nonces,
         )
@@ -766,6 +868,8 @@ class WorkerContext:
     def handle_discover(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
         """Accept DISCOVER and return the worker capability card."""
         self.accept_inbound(envelope)
+        if envelope["body"].get("capabilityCardHash") != self.capability_card()["cardHash"]:
+            raise ValueError("DISCOVER capabilityCardHash does not match worker card")
         return {"capabilityCard": self.capability_card()}
 
     def handle_negotiate(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
@@ -1013,6 +1117,34 @@ def write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def load_json(path: Path) -> Any:
+    """Load JSON from a path."""
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_public_keys(requester: AgentIdentity, worker: AgentIdentity, path: Path) -> None:
+    """Persist public key evidence for offline verification."""
+    write_json(
+        path,
+        {
+            requester.did: export_public_key(requester),
+            worker.did: export_public_key(worker),
+        },
+    )
+
+
+def load_public_keys(path: Path) -> Dict[str, Ed25519PublicKey]:
+    """Load persisted public keys for offline verification."""
+    records = load_json(path)
+    public_keys: Dict[str, Ed25519PublicKey] = {}
+    for did, record in records.items():
+        expected_kid = f"{did}#key-1"
+        if record.get("kid") != expected_kid:
+            raise ValueError(f"public key kid mismatch for {did}")
+        public_keys[did] = import_public_key(record)
+    return public_keys
+
+
 def create_mock_photo_library() -> Path:
     """Create the local mock photo library and sidecar metadata."""
     photo_dir = Path("/tmp/mock_photos_atp").resolve()
@@ -1209,7 +1341,13 @@ def accept_response_envelope(
     nonces: NonceTracker,
 ) -> None:
     """Requester-side validation, state transition, and transcript append."""
-    verify_envelope(envelope, event_log.current_root, public_keys, nonces)
+    verify_envelope(
+        envelope,
+        event_log.current_root,
+        REQUESTER_DID,
+        public_keys,
+        nonces,
+    )
     state_machine.validate(envelope["verb"], envelope["body"])
     event_log.append(envelope)
     state_machine.apply(envelope["verb"], envelope["body"])
@@ -1224,8 +1362,9 @@ def run_demo() -> Dict[str, Any]:
         requester.did: requester.public_key,
         worker.did: worker.public_key,
     }
+    write_public_keys(requester, worker, RUN_DIR / "public-keys.json")
     nonces = NonceTracker()
-    event_log = EventLog(RUN_DIR / "transcript.jsonl")
+    event_log = EventLog(RUN_DIR / "transcript.jsonl", RUN_DIR / "envelopes.jsonl")
     state_machine = StateMachine()
     photo_dir = create_mock_photo_library()
     original_hashes_before = original_photo_hashes(photo_dir)
@@ -1245,9 +1384,9 @@ def run_demo() -> Dict[str, Any]:
     server, thread = start_worker_server(context)
     try:
         endpoint = f"http://127.0.0.1:{port}/atp"
-        card = get_json(f"http://127.0.0.1:{port}/.well-known/atp.json")
-        if card["agentId"] != worker.did:
-            raise ValueError("worker capability card did not match expected DID")
+        signed_card = get_json(f"http://127.0.0.1:{port}/.well-known/atp.json")
+        verify_capability_card(signed_card, worker.public_key)
+        write_json(RUN_DIR / "capability-card.json", signed_card)
 
         intent = build_intent()
         discover = make_envelope(
@@ -1256,11 +1395,19 @@ def run_demo() -> Dict[str, Any]:
             verb="DISCOVER",
             transaction_id=TRANSACTION_ID,
             prev=event_log.current_root,
-            body={"intent": intent, "capability": "photo-organization"},
+            body={
+                "intent": intent,
+                "capability": "photo-organization",
+                "capabilityCardHash": signed_card["cardHash"],
+            },
             expires_at=utc_now() + timedelta(hours=1),
         )
         discover_response = post_json(endpoint, discover)
-        if "photo-organization" not in discover_response["capabilityCard"]["capabilities"]:
+        response_card = discover_response["capabilityCard"]
+        verify_capability_card(response_card, worker.public_key)
+        if response_card["cardHash"] != signed_card["cardHash"]:
+            raise ValueError("DISCOVER response capability card hash mismatch")
+        if "photo-organization" not in response_card["card"]["capabilities"]:
             raise ValueError("worker does not advertise photo-organization")
 
         offer_body = build_offer_body()
@@ -1334,13 +1481,14 @@ def run_demo() -> Dict[str, Any]:
         )
         write_json(RUN_DIR / "receipt.json", receipt)
 
-        verification = verify_outputs(
-            event_log=event_log,
-            receipt=receipt,
-            worker_public_key=worker.public_key,
-            lease_guard=context.lease_guard,
-            original_files_unchanged=original_files_unchanged,
+        verification = offline_verify(RUN_DIR)
+        if not original_files_unchanged:
+            raise ValueError("original photo files changed")
+        verification["originalFilesUnchanged"] = (
+            verification["originalFilesUnchanged"] and original_files_unchanged
         )
+        if not verification["originalFilesUnchanged"]:
+            raise ValueError("original photo file verification failed")
         write_json(RUN_DIR / "verification.json", verification)
         return verification
     finally:
@@ -1352,99 +1500,222 @@ def run_demo() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def verify_event_chain(event_log: EventLog, receipt: Dict[str, Any]) -> bool:
-    """Verify transcript hash chaining and receipt SETTLE-root binding."""
-    events = read_jsonl(event_log.path)
-    if len(events) != len(event_log.envelopes):
-        raise ValueError("transcript and in-memory envelope counts differ")
-    if not events:
-        raise ValueError("transcript is empty")
+def expected_audience_for_envelope(envelope: Dict[str, Any]) -> str:
+    """Infer the expected ATP audience for the persisted demo flow."""
+    issuer = envelope["issuer"]
+    verb = envelope["verb"]
+    body_type = envelope["body"].get("type")
+    if issuer == REQUESTER_DID and verb in {"DISCOVER", "ROUTE"}:
+        return WORKER_DID
+    if issuer == REQUESTER_DID and verb == "NEGOTIATE" and body_type == "offer":
+        return WORKER_DID
+    if issuer == WORKER_DID and verb in {"SETTLE", "ATTEST"}:
+        return REQUESTER_DID
+    if issuer == WORKER_DID and verb == "NEGOTIATE" and body_type == "accept":
+        return REQUESTER_DID
+    raise ValueError(f"cannot infer audience for {issuer} {verb}")
+
+
+def verify_envelope_and_event_files(
+    envelopes: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    public_keys: Dict[str, Ed25519PublicKey],
+    receipt: Dict[str, Any],
+) -> Tuple[bool, bool, str]:
+    """Verify persisted envelopes, transcript events, and SETTLE-root binding."""
+    if len(envelopes) != len(events):
+        raise ValueError("envelopes.jsonl and transcript.jsonl counts differ")
+    if len(envelopes) != 6:
+        raise ValueError(f"expected 6 ATP envelopes, got {len(envelopes)}")
+    expected_verbs = ["DISCOVER", "NEGOTIATE", "NEGOTIATE", "ROUTE", "SETTLE", "ATTEST"]
+    observed_verbs = [envelope["verb"] for envelope in envelopes]
+    if observed_verbs != expected_verbs:
+        raise ValueError(f"unexpected ATP verb sequence: {observed_verbs}")
+
+    nonces = NonceTracker()
     previous = GENESIS_HASH
     settle_root: Optional[str] = None
-    for index, event in enumerate(events):
-        envelope = event_log.envelopes[index]
-        if event["prev"] != previous:
-            raise ValueError(f"event {index} prev mismatch")
-        expected_body_hash = sha256_json(envelope["body"])
-        if event["bodyHash"] != expected_body_hash:
-            raise ValueError(f"event {index} bodyHash mismatch")
-        expected_event_hash = EventLog.compute_event_hash(
-            event["prev"],
-            event["verb"],
-            event["actor"],
-            event["bodyHash"],
-            event["time"],
-            event["nonce"],
+    for index, (envelope, event) in enumerate(zip(envelopes, events)):
+        verify_envelope(
+            envelope=envelope,
+            expected_prev=previous,
+            expected_audience=expected_audience_for_envelope(envelope),
+            public_keys=public_keys,
+            nonces=nonces,
+            check_expiry=False,
         )
-        if event["eventHash"] != expected_event_hash:
-            raise ValueError(f"event {index} eventHash mismatch")
-        if event["verb"] == "SETTLE":
-            settle_root = event["eventHash"]
-        previous = event["eventHash"]
-    if events[-1]["verb"] != "ATTEST":
-        raise ValueError("last event is not ATTEST")
+        proof = envelope["proofs"][0]
+        expected_body_hash = sha256_json(envelope["body"])
+        expected_event_hash = EventLog.compute_event_hash(
+            envelope["prev"],
+            envelope["verb"],
+            envelope["issuer"],
+            expected_body_hash,
+            envelope["createdAt"],
+            envelope["nonce"],
+        )
+        expected_event = {
+            "verb": envelope["verb"],
+            "actor": envelope["issuer"],
+            "prev": envelope["prev"],
+            "bodyHash": expected_body_hash,
+            "time": envelope["createdAt"],
+            "nonce": envelope["nonce"],
+            "sig": proof["signature"],
+            "eventHash": expected_event_hash,
+        }
+        if event != expected_event:
+            raise ValueError(f"transcript event {index} does not match envelope")
+        if envelope["verb"] == "SETTLE":
+            settle_root = expected_event_hash
+        previous = expected_event_hash
+
     if settle_root is None:
         raise ValueError("SETTLE event missing")
     if receipt["eventRoot"] != settle_root:
-        raise ValueError(
-            f"receipt eventRoot must equal SETTLE root: {settle_root}, got {receipt['eventRoot']}"
-        )
-    if events[-1]["prev"] != receipt["eventRoot"]:
+        raise ValueError("receipt eventRoot does not match SETTLE event root")
+    # ATP v0.3 demo rule: ATTEST contains the receipt and its prev is the SETTLE root.
+    if envelopes[-1]["prev"] != receipt["eventRoot"]:
         raise ValueError("ATTEST prev must equal receipt eventRoot")
-    return True
+    if envelopes[-1]["body"] != receipt:
+        raise ValueError("ATTEST envelope body does not match receipt.json")
+    return True, True, settle_root
 
 
-def artifact_files_present() -> bool:
-    """Return True when all required artifact files exist."""
-    required = {
-        ARTIFACTS_DIR / "manifest.json",
-        ARTIFACTS_DIR / "album-plan.json",
-        ARTIFACTS_DIR / "duplicate-candidates.csv",
-    }
-    return all(path.is_file() for path in required)
-
-
-def verify_outputs(
-    event_log: EventLog,
+def verify_artifacts_from_receipt(
     receipt: Dict[str, Any],
-    worker_public_key: Ed25519PublicKey,
-    lease_guard: Optional[LeaseGuard],
-    original_files_unchanged: bool,
-) -> Dict[str, Any]:
-    """Verify the local Proof of Cognition output tree."""
-    if lease_guard is None:
-        raise ValueError("lease guard was not created")
-    receipt_signature_valid = verify_receipt(receipt, worker_public_key)
-    event_chain_valid = verify_event_chain(event_log, receipt)
-    denied_write_attempt_observed = lease_guard.denied_write_observed()
-    artifacts_present = artifact_files_present()
-    lease_guard_passed = lease_guard.passed(original_files_unchanged) and artifacts_present
-    if not receipt_signature_valid:
-        raise ValueError("receipt signature invalid")
-    if not event_chain_valid:
-        raise ValueError("event chain invalid")
-    if not lease_guard_passed:
-        raise ValueError("lease guard did not pass")
-    if not original_files_unchanged:
-        raise ValueError("original photo files changed")
-    if not denied_write_attempt_observed:
-        raise ValueError("intentional denied write was not observed")
-    if not artifacts_present:
-        raise ValueError("required artifact files missing")
+    artifact_dir: Path,
+) -> Tuple[bool, bool]:
+    """Verify artifact presence and content hashes from the receipt alone."""
+    artifacts = receipt["changed"]["artifacts"]
+    required_paths = {"manifest.json", "album-plan.json", "duplicate-candidates.csv"}
+    observed_paths = {artifact["path"] for artifact in artifacts}
+    if observed_paths != required_paths:
+        raise ValueError(f"receipt artifact paths mismatch: {observed_paths}")
+    for artifact in artifacts:
+        path = artifact_dir / artifact["path"]
+        if not path.is_file():
+            raise ValueError(f"missing artifact: {artifact['path']}")
+        data = path.read_bytes()
+        if sha256_bytes(data) != artifact["sha256"]:
+            raise ValueError(f"artifact hash mismatch: {artifact['path']}")
+        if len(data) != artifact["sizeBytes"]:
+            raise ValueError(f"artifact size mismatch: {artifact['path']}")
+    return True, True
+
+
+def verify_lease_access_log(path: Path, receipt: Dict[str, Any]) -> Tuple[bool, bool, bool]:
+    """Verify denied write evidence and infer original immutability from the audit log."""
+    entries = read_jsonl(path)
+    if not entries:
+        raise ValueError("lease access log is empty")
+    denied = [entry for entry in entries if not entry["allowed"]]
+    denied_write_attempt_observed = any(
+        entry["operation"] == "write"
+        and entry["path"].endswith("illegal-worker-write.txt")
+        for entry in denied
+    )
+    unexpected_denials = [
+        entry for entry in denied if not entry["path"].endswith("illegal-worker-write.txt")
+    ]
+    legitimate_reads = any(
+        entry["operation"] == "read" and entry["allowed"] for entry in entries
+    )
+    legitimate_writes = any(
+        entry["operation"] == "write" and entry["allowed"] for entry in entries
+    )
+    originals_unmodified_claim = receipt["changed"]["originalsModified"] is False
+    original_files_unchanged = originals_unmodified_claim and denied_write_attempt_observed
+    lease_guard_passed = (
+        denied_write_attempt_observed
+        and not unexpected_denials
+        and legitimate_reads
+        and legitimate_writes
+        and original_files_unchanged
+    )
+    return lease_guard_passed, original_files_unchanged, denied_write_attempt_observed
+
+
+def offline_verify(run_dir: Path) -> Dict[str, Any]:
+    """Verify a completed ATP run using only files in its artifact tree."""
+    public_keys = load_public_keys(run_dir / "public-keys.json")
+    if set(public_keys) != {REQUESTER_DID, WORKER_DID}:
+        raise ValueError("public-keys.json does not contain the expected agents")
+    signed_card = load_json(run_dir / "capability-card.json")
+    envelopes = read_jsonl(run_dir / "envelopes.jsonl")
+    events = read_jsonl(run_dir / "transcript.jsonl")
+    receipt = load_json(run_dir / "receipt.json")
+    leases = load_json(run_dir / "leases.json")
+    contract = load_json(run_dir / "contract.json")
+
+    capability_card_valid = verify_capability_card(
+        signed_card,
+        public_keys[WORKER_DID],
+    )
+    if envelopes[0]["body"].get("capabilityCardHash") != signed_card["cardHash"]:
+        raise ValueError("DISCOVER does not commit to capability card hash")
+    verify_leases(leases, public_keys[REQUESTER_DID], check_ttl=False)
+    if contract != {"offer": envelopes[1]["body"], "accept": envelopes[2]["body"]}:
+        raise ValueError("contract.json does not match NEGOTIATE envelopes")
+    if envelopes[2]["body"]["contractHash"] != sha256_json(envelopes[1]["body"]):
+        raise ValueError("NEGOTIATE accept does not commit to offer hash")
+    if envelopes[3]["body"]["contractHash"] != sha256_json(contract):
+        raise ValueError("ROUTE does not commit to final contract hash")
+    if envelopes[3]["body"]["leases"] != leases:
+        raise ValueError("leases.json does not match ROUTE leases")
+    receipt_signature_valid = verify_receipt(receipt, public_keys[WORKER_DID])
+    envelope_signatures_valid, event_chain_valid, event_root = (
+        verify_envelope_and_event_files(envelopes, events, public_keys, receipt)
+    )
+    artifact_files_present, artifact_hashes_valid = verify_artifacts_from_receipt(
+        receipt,
+        run_dir / "artifacts",
+    )
+    lease_guard_passed, original_files_unchanged, denied_write_attempt_observed = (
+        verify_lease_access_log(run_dir / "lease-access-log.jsonl", receipt)
+    )
+    offline_verification_valid = all(
+        [
+            receipt_signature_valid,
+            event_chain_valid,
+            lease_guard_passed,
+            original_files_unchanged,
+            denied_write_attempt_observed,
+            artifact_files_present,
+            artifact_hashes_valid,
+            capability_card_valid,
+            envelope_signatures_valid,
+        ]
+    )
+    if not offline_verification_valid:
+        raise ValueError("offline verification failed")
     return {
         "receiptSignatureValid": receipt_signature_valid,
         "eventChainValid": event_chain_valid,
         "leaseGuardPassed": lease_guard_passed,
         "originalFilesUnchanged": original_files_unchanged,
         "deniedWriteAttemptObserved": denied_write_attempt_observed,
-        "artifactFilesPresent": artifacts_present,
+        "artifactFilesPresent": artifact_files_present,
+        "artifactHashesValid": artifact_hashes_valid,
+        "capabilityCardValid": capability_card_valid,
+        "envelopeSignaturesValid": envelope_signatures_valid,
+        "offlineVerificationValid": offline_verification_valid,
         "receiptHash": receipt["receiptHash"],
-        "eventRoot": receipt["eventRoot"],
+        "eventRoot": event_root,
     }
 
 
 def main() -> None:
-    """Execute the ATP local demo and print the required verification summary."""
+    """Execute or offline-verify the ATP local demo."""
+    if len(sys.argv) == 3 and sys.argv[1] == "verify":
+        verification = offline_verify(Path(sys.argv[2]))
+        if not verification["offlineVerificationValid"]:
+            raise ValueError("offline verification failed")
+        print("Offline verification valid: True")
+        return
+    if len(sys.argv) != 1:
+        raise SystemExit("usage: python atp_demo.py [verify runs/atp_photo_001]")
+
     verification = run_demo()
     receipt_valid = bool(verification["receiptSignatureValid"])
     print(f"ATP transaction complete: {RUN_DIR.as_posix()}/")
@@ -1453,6 +1724,7 @@ def main() -> None:
     print(f"Event chain valid: {verification['eventChainValid']}")
     print(f"Lease guard passed: {verification['leaseGuardPassed']}")
     print(f"Original files unchanged: {verification['originalFilesUnchanged']}")
+    print(f"Offline verification valid: {verification['offlineVerificationValid']}")
 
 
 if __name__ == "__main__":
