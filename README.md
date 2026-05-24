@@ -1,4 +1,4 @@
-# CYPHES ATP Demo
+# Demo
 
 Agent Transfer Protocol (ATP) is a protocol for auditable agent-to-agent work. It defines a signed transaction loop for capability discovery, contract negotiation, leased context access, settlement, and verifiable receipts.
 
