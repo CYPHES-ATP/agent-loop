@@ -30,6 +30,12 @@ Original files unchanged: True
 Offline verification valid: True
 ```
 
+Run Receipt Zero against NASA Artemis II public images:
+
+```bash
+python3 atp_demo.py receipt-zero --limit 100
+```
+
 ## Output
 
 The demo creates:
@@ -64,3 +70,9 @@ Expected output:
 ```text
 Offline verification valid: True
 ```
+
+## Receipt Zero
+
+Receipt Zero runbook: [docs/receipt-zero.md](docs/receipt-zero.md)
+
+ERC-8004 alignment profile: [docs/erc-8004-atp-profile.md](docs/erc-8004-atp-profile.md)

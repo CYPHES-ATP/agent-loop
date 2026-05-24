@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -40,6 +41,21 @@ REQUESTER_DID = "did:example:agent:requester-7"
 WORKER_DID = "did:example:agent:worker-42"
 OWNER_DID = "did:example:owner:123"
 SUPPORTED_VERBS = {"ADVERTISE", "DISCOVER", "NEGOTIATE", "ROUTE", "SETTLE", "ATTEST"}
+NASA_ARTEMIS_TEXT_TABLE_URL = (
+    "https://eol.jsc.nasa.gov/SearchPhotos/"
+    "ShowQueryResults-TextTable.pl?results=Artemis_Artemis2_all"
+)
+NASA_ARTEMIS_SMALL_IMAGE_URL = (
+    "https://eol.jsc.nasa.gov/DatabaseImages/ESC/small/ART002/"
+)
+
+
+def configure_transaction(transaction_id: str) -> None:
+    """Configure the active ATP transaction and output directories."""
+    global TRANSACTION_ID, RUN_DIR, ARTIFACTS_DIR
+    TRANSACTION_ID = transaction_id
+    RUN_DIR = Path("runs") / TRANSACTION_ID
+    ARTIFACTS_DIR = RUN_DIR / "artifacts"
 
 
 # ---------------------------------------------------------------------------
@@ -1145,6 +1161,16 @@ def load_public_keys(path: Path) -> Dict[str, Ed25519PublicKey]:
     return public_keys
 
 
+def download_url_bytes(url: str) -> bytes:
+    """Download bytes with a clear ATP demo user agent."""
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "CYPHES-ATP-Receipt-Zero/0.1"},
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
 def create_mock_photo_library() -> Path:
     """Create the local mock photo library and sidecar metadata."""
     photo_dir = Path("/tmp/mock_photos_atp").resolve()
@@ -1180,10 +1206,107 @@ def create_mock_photo_library() -> Path:
     return photo_dir
 
 
+def parse_nasa_artemis_rows(html_text: str, limit: int) -> List[Dict[str, str]]:
+    """Parse Artemis II table rows from NASA Gateway text-table HTML."""
+    text = re.sub(r"<[^>]+>", " ", html_text)
+    text = re.sub(r"\s+", " ", text)
+    pattern = re.compile(
+        r"(ART002-E-\d+)\s+(\d{8})\s+"
+        r"(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)"
+    )
+    rows: List[Dict[str, str]] = []
+    seen: set = set()
+    for match in pattern.finditer(text):
+        photo_id = match.group(1)
+        if photo_id in seen:
+            continue
+        seen.add(photo_id)
+        rows.append(
+            {
+                "photoId": photo_id,
+                "date": match.group(2),
+                "latitude": match.group(3),
+                "longitude": match.group(4),
+            }
+        )
+        if len(rows) >= limit:
+            break
+    if len(rows) < limit:
+        raise ValueError(f"NASA Artemis table yielded {len(rows)} rows, expected {limit}")
+    return rows
+
+
+def create_nasa_artemis_photo_library(limit: int) -> Path:
+    """Create a local Receipt Zero library from NASA Artemis II public images."""
+    if limit < 1:
+        raise ValueError("Receipt Zero image limit must be at least 1")
+    photo_dir = Path("/tmp/receipt_zero_nasa_artemis").resolve()
+    if photo_dir.exists():
+        shutil.rmtree(photo_dir)
+    photo_dir.mkdir(parents=True, exist_ok=True)
+
+    html_text = download_url_bytes(NASA_ARTEMIS_TEXT_TABLE_URL).decode("utf-8", "replace")
+    rows = parse_nasa_artemis_rows(html_text, limit)
+    photos: List[Dict[str, Any]] = []
+    for row in rows:
+        photo_id = row["photoId"]
+        filename = f"{photo_id}.JPG"
+        source_url = f"{NASA_ARTEMIS_SMALL_IMAGE_URL}{filename}"
+        data = download_url_bytes(source_url)
+        (photo_dir / filename).write_bytes(data)
+        created = f"{row['date'][0:4]}-{row['date'][4:6]}-{row['date'][6:8]}"
+        photos.append(
+            {
+                "filename": filename,
+                "createdDate": created,
+                "eventLabel": "NASA Artemis II public image archive",
+                "contentGroup": f"nasa-artemis-ii-{created}",
+                "contentHash": sha256_bytes(data),
+                "sourcePhotoId": photo_id,
+                "sourceImageUrl": source_url,
+                "sourcePhotoPageUrl": (
+                    "https://eol.jsc.nasa.gov/SearchPhotos/photo.pl?"
+                    f"mission=ART002&roll=E&frame={photo_id.rsplit('-', 1)[-1]}"
+                ),
+                "latitude": row["latitude"],
+                "longitude": row["longitude"],
+            }
+        )
+
+    write_json(
+        photo_dir / "metadata.json",
+        {
+            "dataset": {
+                "name": "NASA Artemis II public image archive",
+                "source": NASA_ARTEMIS_TEXT_TABLE_URL,
+                "imageBaseUrl": NASA_ARTEMIS_SMALL_IMAGE_URL,
+                "imageResolution": "ESC/small",
+                "requestedLimit": limit,
+                "selectedCount": len(photos),
+                "attribution": (
+                    "Image courtesy of the Earth Science and Remote Sensing Unit, "
+                    "NASA Johnson Space Center."
+                ),
+            },
+            "photos": photos,
+        },
+    )
+    return photo_dir
+
+
+def iter_photo_files(photo_dir: Path) -> List[Path]:
+    """Return source photo files using case-insensitive JPG matching."""
+    return sorted(
+        path
+        for path in photo_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".jpg"
+    )
+
+
 def original_photo_hashes(photo_dir: Path) -> Dict[str, str]:
-    """Hash all original mock jpg files."""
+    """Hash all original source JPG files."""
     hashes: Dict[str, str] = {}
-    for path in sorted(photo_dir.glob("*.jpg")):
+    for path in iter_photo_files(photo_dir):
         hashes[path.name] = sha256_bytes(path.read_bytes())
     return hashes
 
@@ -1193,13 +1316,22 @@ def originals_unchanged(before: Dict[str, str], photo_dir: Path) -> bool:
     return before == original_photo_hashes(photo_dir)
 
 
-def build_intent() -> Dict[str, Any]:
-    """Create the requester ATP intent for the photo organization demo."""
+def build_intent(dataset_name: str = "mock") -> Dict[str, Any]:
+    """Create the requester ATP intent for a photo organization transaction."""
     deadline = utc_now() + timedelta(hours=1)
+    if dataset_name == "nasa-artemis":
+        goal = (
+            "Audit NASA Artemis II public image archive for exact duplicate "
+            "candidates and produce a verifiable archive manifest"
+        )
+        success = "public-receipt-verifies-dataset-artifacts"
+    else:
+        goal = "Organize photo library into dated event albums"
+        success = "owner-approves-staged-manifest"
     return {
-        "goal": "Organize photo library into dated event albums",
+        "goal": goal,
         "constraints": ["do-not-delete-originals", "stage-changes-first"],
-        "success": "owner-approves-staged-manifest",
+        "success": success,
         "budget": {"amount": "0", "asset": "none"},
         "deadline": iso_utc(deadline),
     }
@@ -1353,7 +1485,7 @@ def accept_response_envelope(
     state_machine.apply(envelope["verb"], envelope["body"])
 
 
-def run_demo() -> Dict[str, Any]:
+def run_demo(dataset_name: str = "mock", dataset_limit: int = 10) -> Dict[str, Any]:
     """Run the full local ATP transaction and return verification results."""
     reset_run_dir()
     requester = AgentIdentity.create(REQUESTER_DID)
@@ -1366,7 +1498,10 @@ def run_demo() -> Dict[str, Any]:
     nonces = NonceTracker()
     event_log = EventLog(RUN_DIR / "transcript.jsonl", RUN_DIR / "envelopes.jsonl")
     state_machine = StateMachine()
-    photo_dir = create_mock_photo_library()
+    if dataset_name == "nasa-artemis":
+        photo_dir = create_nasa_artemis_photo_library(dataset_limit)
+    else:
+        photo_dir = create_mock_photo_library()
     original_hashes_before = original_photo_hashes(photo_dir)
     port = find_worker_port()
     context = WorkerContext(
@@ -1388,7 +1523,7 @@ def run_demo() -> Dict[str, Any]:
         verify_capability_card(signed_card, worker.public_key)
         write_json(RUN_DIR / "capability-card.json", signed_card)
 
-        intent = build_intent()
+        intent = build_intent(dataset_name)
         discover = make_envelope(
             issuer=requester,
             audience=worker.did,
@@ -1708,13 +1843,39 @@ def offline_verify(run_dir: Path) -> Dict[str, Any]:
 def main() -> None:
     """Execute or offline-verify the ATP local demo."""
     if len(sys.argv) == 3 and sys.argv[1] == "verify":
-        verification = offline_verify(Path(sys.argv[2]))
+        run_dir = Path(sys.argv[2])
+        receipt = load_json(run_dir / "receipt.json")
+        configure_transaction(receipt["transactionId"])
+        verification = offline_verify(run_dir)
         if not verification["offlineVerificationValid"]:
             raise ValueError("offline verification failed")
         print("Offline verification valid: True")
         return
+    if len(sys.argv) in {2, 4} and sys.argv[1] == "receipt-zero":
+        limit = 100
+        if len(sys.argv) == 4:
+            if sys.argv[2] != "--limit":
+                raise SystemExit(
+                    "usage: python atp_demo.py receipt-zero [--limit N]"
+                )
+            limit = int(sys.argv[3])
+        configure_transaction("receipt_zero_001")
+        verification = run_demo(dataset_name="nasa-artemis", dataset_limit=limit)
+        receipt_valid = bool(verification["receiptSignatureValid"])
+        print(f"Receipt Zero complete: {RUN_DIR.as_posix()}/")
+        print(f"Receipt hash: {verification['receiptHash']}")
+        print(f"Receipt valid: {receipt_valid}")
+        print(f"Event chain valid: {verification['eventChainValid']}")
+        print(f"Lease guard passed: {verification['leaseGuardPassed']}")
+        print(f"Original files unchanged: {verification['originalFilesUnchanged']}")
+        print(f"Offline verification valid: {verification['offlineVerificationValid']}")
+        return
     if len(sys.argv) != 1:
-        raise SystemExit("usage: python atp_demo.py [verify runs/atp_photo_001]")
+        raise SystemExit(
+            "usage: python atp_demo.py "
+            "[verify runs/atp_photo_001] "
+            "[receipt-zero --limit N]"
+        )
 
     verification = run_demo()
     receipt_valid = bool(verification["receiptSignatureValid"])

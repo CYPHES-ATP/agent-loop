@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Receipt Zero</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f4;
+      --ink: #111;
+      --muted: #5c5c55;
+      --line: #d9d7cf;
+      --panel: #fff;
+      --ok: #0f7a3f;
+      --bad: #a71e1e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 48px 20px 72px;
+    }
+    h1, h2, h3 { line-height: 1.1; margin: 0; }
+    h1 { font-size: 42px; }
+    h2 { font-size: 22px; margin-bottom: 14px; }
+    h3 { font-size: 16px; margin-bottom: 6px; }
+    p { margin: 8px 0 0; }
+    code {
+      padding: 2px 5px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #f3f2ed;
+      font-size: 13px;
+    }
+    pre {
+      overflow: auto;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f3f2ed;
+    }
+    .hero {
+      display: grid;
+      gap: 16px;
+      padding-bottom: 32px;
+      border-bottom: 1px solid var(--line);
+    }
+    .muted { color: var(--muted); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 24px;
+    }
+    section {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+    .wide { grid-column: 1 / -1; }
+    .kv {
+      display: grid;
+      grid-template-columns: 180px minmax(0, 1fr);
+      gap: 8px 14px;
+      margin-top: 12px;
+    }
+    .value {
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+    }
+    .checks {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--bad);
+      flex: 0 0 auto;
+    }
+    .check[data-ok="true"] .dot { background: var(--ok); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    td { overflow-wrap: anywhere; }
+    @media (max-width: 760px) {
+      h1 { font-size: 32px; }
+      .grid { grid-template-columns: 1fr; }
+      .kv { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="hero">
+      <h1>Receipt Zero</h1>
+      <p class="muted">ATP receipt bundle viewer. Host this file beside the generated receipt tree or pass <code>?base=/path/to/run/</code>.</p>
+      <pre>python3 atp_demo.py verify runs/receipt_zero_001</pre>
+    </div>
+
+    <div class="grid">
+      <section class="wide">
+        <h2>Receipt</h2>
+        <div class="kv" id="receipt-summary"></div>
+      </section>
+
+      <section>
+        <h2>Verification</h2>
+        <div class="checks" id="verification-checks"></div>
+      </section>
+
+      <section>
+        <h2>Capability</h2>
+        <div class="kv" id="capability-summary"></div>
+      </section>
+
+      <section class="wide">
+        <h2>Requested</h2>
+        <div class="kv" id="requested-summary"></div>
+      </section>
+
+      <section class="wide">
+        <h2>Artifacts</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Path</th>
+              <th>SHA-256</th>
+              <th>Bytes</th>
+              <th>Media</th>
+            </tr>
+          </thead>
+          <tbody id="artifact-rows"></tbody>
+        </table>
+      </section>
+
+      <section class="wide">
+        <h2>Lease Access</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Allowed</th>
+              <th>Operation</th>
+              <th>Lease</th>
+              <th>Path</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="lease-rows"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const base = params.get("base") || "./";
+
+    function runUrl(path) {
+      return new URL(path, new URL(base, location.href)).href;
+    }
+
+    async function fetchJson(path) {
+      const response = await fetch(runUrl(path));
+      if (!response.ok) throw new Error(`Failed to load ${path}`);
+      return response.json();
+    }
+
+    async function fetchJsonl(path) {
+      const response = await fetch(runUrl(path));
+      if (!response.ok) throw new Error(`Failed to load ${path}`);
+      const text = await response.text();
+      return text.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    }
+
+    function kv(target, entries) {
+      target.innerHTML = "";
+      for (const [key, value] of entries) {
+        const label = document.createElement("div");
+        label.className = "muted";
+        label.textContent = key;
+        const content = document.createElement("div");
+        content.className = "value";
+        content.textContent = typeof value === "string" ? value : JSON.stringify(value);
+        target.append(label, content);
+      }
+    }
+
+    function addChecks(target, checks) {
+      target.innerHTML = "";
+      for (const [key, value] of Object.entries(checks)) {
+        if (typeof value !== "boolean") continue;
+        const row = document.createElement("div");
+        row.className = "check";
+        row.dataset.ok = String(value);
+        row.innerHTML = `<span class="dot"></span><span>${key}: ${value}</span>`;
+        target.append(row);
+      }
+    }
+
+    async function load() {
+      const [receipt, verification, card, access] = await Promise.all([
+        fetchJson("receipt.json"),
+        fetchJson("verification.json"),
+        fetchJson("capability-card.json"),
+        fetchJsonl("lease-access-log.jsonl"),
+      ]);
+
+      kv(document.getElementById("receipt-summary"), [
+        ["transactionId", receipt.transactionId],
+        ["receiptHash", receipt.receiptHash],
+        ["eventRoot", receipt.eventRoot],
+        ["worker", receipt.signatures?.[0]?.kid || ""],
+      ]);
+      kv(document.getElementById("capability-summary"), [
+        ["agentId", card.card.agentId],
+        ["cardHash", card.cardHash],
+        ["capabilities", card.card.capabilities.join(", ")],
+      ]);
+      kv(document.getElementById("requested-summary"), [
+        ["goal", receipt.requested.intent.goal],
+        ["constraints", receipt.requested.constraints.join(", ")],
+        ["success", receipt.requested.success],
+        ["deadline", receipt.requested.deadline],
+      ]);
+      addChecks(document.getElementById("verification-checks"), verification);
+
+      const artifactRows = document.getElementById("artifact-rows");
+      artifactRows.innerHTML = "";
+      for (const artifact of receipt.changed.artifacts) {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td>${artifact.path}</td>
+          <td>${artifact.sha256}</td>
+          <td>${artifact.sizeBytes}</td>
+          <td>${artifact.mediaType}</td>
+        `;
+        artifactRows.append(row);
+      }
+
+      const leaseRows = document.getElementById("lease-rows");
+      leaseRows.innerHTML = "";
+      for (const item of access) {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td>${item.allowed ? "yes" : "no"}</td>
+          <td>${item.operation}</td>
+          <td>${item.leaseId}</td>
+          <td>${item.path}</td>
+          <td>${item.reason}</td>
+        `;
+        leaseRows.append(row);
+      }
+    }
+
+    load().catch(error => {
+      document.body.innerHTML = `<main><h1>Receipt Zero</h1><pre>${error.message}</pre></main>`;
+    });
+  </script>
+</body>
+</html>
