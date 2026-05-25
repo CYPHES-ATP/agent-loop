@@ -12,6 +12,12 @@ Install dependencies:
 python3 -m pip install cryptography fastapi uvicorn
 ```
 
+Receipt Zero visual dedupe also requires Pillow:
+
+```bash
+python3 -m pip install Pillow
+```
+
 Run the local demo:
 
 ```bash

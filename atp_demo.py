@@ -48,6 +48,7 @@ NASA_ARTEMIS_TEXT_TABLE_URL = (
 NASA_ARTEMIS_SMALL_IMAGE_URL = (
     "https://eol.jsc.nasa.gov/DatabaseImages/ESC/small/ART002/"
 )
+VISUAL_DHASH_THRESHOLD = 10
 
 
 def configure_transaction(transaction_id: str) -> None:
@@ -318,8 +319,12 @@ def post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"POST {url} failed with {exc.code}: {detail}") from exc
 
 
 def get_json(url: str) -> Dict[str, Any]:
@@ -963,24 +968,44 @@ class WorkerContext:
         metadata_path = self.photo_dir / "metadata.json"
         metadata = json.loads(self.lease_guard.read_text(metadata_path))
         photos = metadata["photos"]
+        dedupe = metadata.get("dedupe", {"mode": "content-hash"})
+        dedupe_mode = dedupe.get("mode", "content-hash")
+        visual_threshold = int(
+            dedupe.get("hammingDistanceThreshold", VISUAL_DHASH_THRESHOLD)
+        )
         for photo in photos:
             photo_path = self.photo_dir / photo["filename"]
             data = self.lease_guard.read_bytes(photo_path)
             observed_hash = sha256_bytes(data)
             if observed_hash != photo["contentHash"]:
                 raise ValueError(f"content hash mismatch for {photo['filename']}")
+            if dedupe_mode == "visual-dhash":
+                photo["visualHash"] = visual_dhash_from_bytes(data)
 
+        duplicate_rows = find_duplicates(photos, dedupe_mode, visual_threshold)
         albums = build_album_plan(photos)
-        duplicate_rows = find_duplicates(photos)
+        unique_photos = [
+            photo["filename"] for photo in photos if not photo.get("duplicateOf")
+        ]
         manifest = {
             "transactionId": TRANSACTION_ID,
             "generatedAt": iso_utc(utc_now()),
+            "dataset": metadata.get("dataset", {"name": "mock photo library"}),
+            "dedupe": {
+                **dedupe,
+                "mode": dedupe_mode,
+                "duplicateCandidateCount": len(duplicate_rows),
+                "uniquePhotoCount": len(unique_photos),
+                "inputPhotoCount": len(photos),
+            },
             "photos": photos,
+            "uniquePhotos": sorted(unique_photos),
             "proposedAlbums": [
                 {
                     "album": album["album"],
                     "targetFolder": album["targetFolder"],
                     "photoCount": len(album["photos"]),
+                    "uniquePhotoCount": len(album["uniquePhotos"]),
                 }
                 for album in albums
             ],
@@ -1163,12 +1188,20 @@ def load_public_keys(path: Path) -> Dict[str, Ed25519PublicKey]:
 
 def download_url_bytes(url: str) -> bytes:
     """Download bytes with a clear ATP demo user agent."""
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "CYPHES-ATP-Receipt-Zero/0.1"},
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return response.read()
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, 4):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "CYPHES-ATP-Receipt-Zero/0.1"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return response.read()
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(1.0)
+    raise RuntimeError(f"download failed for {url}: {last_error}")
 
 
 def create_mock_photo_library() -> Path:
@@ -1288,6 +1321,12 @@ def create_nasa_artemis_photo_library(limit: int) -> Path:
                     "NASA Johnson Space Center."
                 ),
             },
+            "dedupe": {
+                "mode": "visual-dhash",
+                "algorithm": "64-bit difference hash over grayscale 9x8 pixels",
+                "hammingDistanceThreshold": VISUAL_DHASH_THRESHOLD,
+                "selectionPolicy": "keep-first-observed-photo-per-visual-cluster",
+            },
             "photos": photos,
         },
     )
@@ -1316,13 +1355,39 @@ def originals_unchanged(before: Dict[str, str], photo_dir: Path) -> bool:
     return before == original_photo_hashes(photo_dir)
 
 
+def visual_dhash_from_bytes(data: bytes) -> str:
+    """Compute a 64-bit visual difference hash for near-duplicate detection."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "Receipt Zero visual dedupe requires Pillow. "
+            "Install it with: python3 -m pip install Pillow"
+        ) from exc
+    with Image.open(io.BytesIO(data)) as image:
+        grayscale = image.convert("L").resize((9, 8))
+        pixels = list(grayscale.getdata())
+    value = 0
+    for y in range(8):
+        for x in range(8):
+            left = pixels[y * 9 + x]
+            right = pixels[y * 9 + x + 1]
+            value = (value << 1) | int(left > right)
+    return f"{value:016x}"
+
+
+def hamming_distance_hex(left: str, right: str) -> int:
+    """Return the bit distance between two equal-width hexadecimal hashes."""
+    return bin(int(left, 16) ^ int(right, 16)).count("1")
+
+
 def build_intent(dataset_name: str = "mock") -> Dict[str, Any]:
     """Create the requester ATP intent for a photo organization transaction."""
     deadline = utc_now() + timedelta(hours=1)
     if dataset_name == "nasa-artemis":
         goal = (
-            "Audit NASA Artemis II public image archive for exact duplicate "
-            "candidates and produce a verifiable archive manifest"
+            "Audit NASA Artemis II public image archive for visual duplicate "
+            "clusters and produce a verifiable unique-image manifest"
         )
         success = "public-receipt-verifies-dataset-artifacts"
     else:
@@ -1398,24 +1463,28 @@ def build_leases(
 
 def build_album_plan(photos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Group photos by event/date into proposed albums."""
-    grouped: Dict[Tuple[str, str], List[str]] = {}
+    grouped: Dict[Tuple[str, str], Dict[str, List[str]]] = {}
     for photo in photos:
         key = (photo["createdDate"], photo["eventLabel"])
-        grouped.setdefault(key, []).append(photo["filename"])
+        group = grouped.setdefault(key, {"photos": [], "uniquePhotos": []})
+        group["photos"].append(photo["filename"])
+        if not photo.get("duplicateOf"):
+            group["uniquePhotos"].append(photo["filename"])
     albums: List[Dict[str, Any]] = []
-    for (created, event_label), filenames in sorted(grouped.items()):
+    for (created, event_label), group in sorted(grouped.items()):
         folder = f"{created}_{slug(event_label)}"
         albums.append(
             {
                 "album": event_label,
                 "targetFolder": folder,
-                "photos": sorted(filenames),
+                "photos": sorted(group["photos"]),
+                "uniquePhotos": sorted(group["uniquePhotos"]),
             }
         )
     return albums
 
 
-def find_duplicates(photos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def find_exact_duplicates(photos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Find duplicate candidates by identical content hash."""
     by_hash: Dict[str, List[str]] = {}
     for photo in photos:
@@ -1436,6 +1505,49 @@ def find_duplicates(photos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 }
             )
     return rows
+
+
+def find_visual_duplicates(
+    photos: List[Dict[str, Any]],
+    threshold: int,
+) -> List[Dict[str, Any]]:
+    """Cluster visually similar photos by dHash distance and keep one representative."""
+    rows: List[Dict[str, Any]] = []
+    representatives: List[Dict[str, Any]] = []
+    for photo in sorted(photos, key=lambda item: item["filename"]):
+        visual_hash = photo["visualHash"]
+        best: Optional[Tuple[Dict[str, Any], int]] = None
+        for representative in representatives:
+            distance = hamming_distance_hex(visual_hash, representative["visualHash"])
+            if distance <= threshold and (best is None or distance < best[1]):
+                best = (representative, distance)
+        if best is None:
+            photo["duplicateOf"] = None
+            representatives.append(photo)
+            continue
+        representative, distance = best
+        photo["duplicateOf"] = representative["filename"]
+        confidence = max(0.0, 1.0 - (distance / (threshold + 1)))
+        rows.append(
+            {
+                "photo_a": representative["filename"],
+                "photo_b": photo["filename"],
+                "content_hash": f"visual-dhash:{representative['visualHash']}",
+                "confidence": f"{confidence:.3f}",
+            }
+        )
+    return rows
+
+
+def find_duplicates(
+    photos: List[Dict[str, Any]],
+    dedupe_mode: str,
+    threshold: int,
+) -> List[Dict[str, Any]]:
+    """Find duplicate candidates using the configured archive dedupe mode."""
+    if dedupe_mode == "visual-dhash":
+        return find_visual_duplicates(photos, threshold)
+    return find_exact_duplicates(photos)
 
 
 def duplicate_candidates_csv(rows: List[Dict[str, Any]]) -> str:

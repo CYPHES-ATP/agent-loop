@@ -26,6 +26,7 @@ Install dependencies:
 
 ```bash
 python3 -m pip install cryptography fastapi uvicorn
+python3 -m pip install Pillow
 ```
 
 Run a rehearsal:
@@ -114,6 +115,8 @@ https://atp.cyphes.io/spec/erc-8004-atp-profile
 
 ## Non-Goals
 
-Receipt Zero does not claim visual near-duplicate detection. The current run detects exact duplicate candidates by identical SHA-256 content hash.
+Receipt Zero uses a deterministic visual dedupe pass based on a 64-bit perceptual difference hash. It groups near-duplicate image frames when their visual hashes are within the configured Hamming-distance threshold and keeps the first observed photo as the representative image.
+
+This is intended for redundant frame selection, not broad semantic classification. A later node can add embedding-based similarity for higher-level concepts such as "all photos of the same kind of terrain."
 
 Receipt Zero does not require trusting the worker, requester, hosting provider, or live server state. The offline verifier uses the persisted public keys, signed envelopes, event log, receipt, artifacts, and lease log.
