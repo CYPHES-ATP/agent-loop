@@ -1239,7 +1239,7 @@ def create_mock_photo_library() -> Path:
     return photo_dir
 
 
-def parse_nasa_artemis_rows(html_text: str, limit: int) -> List[Dict[str, str]]:
+def parse_nasa_artemis_rows(html_text: str) -> List[Dict[str, str]]:
     """Parse Artemis II table rows from NASA Gateway text-table HTML."""
     text = re.sub(r"<[^>]+>", " ", html_text)
     text = re.sub(r"\s+", " ", text)
@@ -1262,11 +1262,34 @@ def parse_nasa_artemis_rows(html_text: str, limit: int) -> List[Dict[str, str]]:
                 "longitude": match.group(4),
             }
         )
-        if len(rows) >= limit:
-            break
-    if len(rows) < limit:
-        raise ValueError(f"NASA Artemis table yielded {len(rows)} rows, expected {limit}")
+    if not rows:
+        raise ValueError("NASA Artemis table yielded no photo rows")
     return rows
+
+
+def select_spread_rows(
+    rows: List[Dict[str, str]],
+    limit: int,
+) -> List[Dict[str, str]]:
+    """Select rows evenly across the public archive instead of sequential frames."""
+    if limit >= len(rows):
+        return rows
+    if limit == 1:
+        return [rows[0]]
+    indexes = [
+        round(index * (len(rows) - 1) / (limit - 1))
+        for index in range(limit)
+    ]
+    selected: List[Dict[str, str]] = []
+    seen: set = set()
+    for index in indexes:
+        row = rows[index]
+        photo_id = row["photoId"]
+        if photo_id in seen:
+            continue
+        seen.add(photo_id)
+        selected.append(row)
+    return selected
 
 
 def create_nasa_artemis_photo_library(limit: int) -> Path:
@@ -1279,7 +1302,8 @@ def create_nasa_artemis_photo_library(limit: int) -> Path:
     photo_dir.mkdir(parents=True, exist_ok=True)
 
     html_text = download_url_bytes(NASA_ARTEMIS_TEXT_TABLE_URL).decode("utf-8", "replace")
-    rows = parse_nasa_artemis_rows(html_text, limit)
+    all_rows = parse_nasa_artemis_rows(html_text)
+    rows = select_spread_rows(all_rows, limit)
     photos: List[Dict[str, Any]] = []
     for row in rows:
         photo_id = row["photoId"]
@@ -1316,6 +1340,8 @@ def create_nasa_artemis_photo_library(limit: int) -> Path:
                 "imageResolution": "ESC/small",
                 "requestedLimit": limit,
                 "selectedCount": len(photos),
+                "availableCount": len(all_rows),
+                "selectionMethod": "evenly-spaced-across-source-results",
                 "attribution": (
                     "Image courtesy of the Earth Science and Remote Sensing Unit, "
                     "NASA Johnson Space Center."
@@ -1514,7 +1540,7 @@ def find_visual_duplicates(
     """Cluster visually similar photos by dHash distance and keep one representative."""
     rows: List[Dict[str, Any]] = []
     representatives: List[Dict[str, Any]] = []
-    for photo in sorted(photos, key=lambda item: item["filename"]):
+    for photo in photos:
         visual_hash = photo["visualHash"]
         best: Optional[Tuple[Dict[str, Any], int]] = None
         for representative in representatives:

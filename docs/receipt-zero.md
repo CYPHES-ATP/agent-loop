@@ -18,7 +18,7 @@ Image source pattern:
 https://eol.jsc.nasa.gov/DatabaseImages/ESC/small/ART002/<PHOTO_ID>.JPG
 ```
 
-The NASA Gateway result page reports 11,364 Artemis II images. The current command accepts a `--limit` value so the run can be rehearsed on a small subset before the public canonical run.
+The NASA Gateway result page reports 11,364 Artemis II images. The current command accepts a `--limit` value so the run can be rehearsed on a small subset before the public canonical run. Receipt Zero samples evenly across the source result set instead of taking only sequential frames.
 
 ## Run
 
