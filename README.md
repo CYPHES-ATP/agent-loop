@@ -77,8 +77,8 @@ Expected output:
 Offline verification valid: True
 ```
 
-## Receipt Zero
+## Genesis
 
-Receipt Zero runbook: [docs/receipt-zero.md](docs/receipt-zero.md)
+Runbook: [docs/receipt-zero.md](docs/receipt-zero.md)
 
 ERC-8004 alignment profile: [docs/erc-8004-atp-profile.md](docs/erc-8004-atp-profile.md)
