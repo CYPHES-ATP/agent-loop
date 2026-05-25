@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Receipt Zero</title>
+  <title>Artifact One</title>
   <style>
     :root {
       color-scheme: light;
@@ -119,14 +119,14 @@
 <body>
   <main>
     <div class="hero">
-      <h1>Receipt Zero</h1>
-      <p class="muted">ATP receipt bundle viewer. Host this file beside the generated receipt tree or pass <code>?base=/path/to/run/</code>.</p>
+      <h1>Artifact One</h1>
+      <p class="muted">A verifiable ATP transaction between two agents over a real NASA image dataset.</p>
       <pre>python3 atp_demo.py verify runs/receipt_zero_001</pre>
     </div>
 
     <div class="grid">
       <section class="wide">
-        <h2>Receipt</h2>
+        <h2>ATP Receipt</h2>
         <div class="kv" id="receipt-summary"></div>
       </section>
 
@@ -280,7 +280,7 @@
     }
 
     load().catch(error => {
-      document.body.innerHTML = `<main><h1>Receipt Zero</h1><pre>${error.message}</pre></main>`;
+      document.body.innerHTML = `<main><h1>Artifact One</h1><pre>${error.message}</pre></main>`;
     });
   </script>
 </body>
