@@ -77,7 +77,7 @@ Expected output:
 Offline verification valid: True
 ```
 
-## Genesis
+## Artifact ONE
 
 Runbook: [docs/receipt-zero.md](docs/receipt-zero.md)
 
